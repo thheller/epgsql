@@ -5,7 +5,7 @@
 -behavior(gen_fsm).
 
 -export([start_link/0, stop/1, connect/5, get_parameter/2]).
--export([squery/2, equery/3]).
+-export([squery/2, equery/3, store_oid_map/2]).
 -export([parse/4, bind/4, execute/4, describe/3]).
 -export([close/3, sync/1]).
 
@@ -29,7 +29,9 @@
           async,
           backend,
           statement,
-          txstatus}).
+          txstatus,
+          oid_map = undefined
+        }).
 
 -define(int16, 1/big-signed-unit:16).
 -define(int32, 1/big-signed-unit:32).
@@ -53,6 +55,9 @@ squery(C, Sql) ->
 
 equery(C, Statement, Parameters) ->
     gen_fsm:sync_send_event(C, {equery, Statement, Parameters}, infinity).
+
+store_oid_map(C, List) ->
+    gen_fsm:sync_send_event(C, {oid_map, List}, infinity).
 
 parse(C, Name, Sql, Types) ->
     gen_fsm:sync_send_event(C, {parse, Name, Sql, Types}, infinity).
@@ -214,6 +219,11 @@ initializing({$Z, <<Status:8>>}, State) ->
 ready(_Msg, State) ->
     {next_state, ready, State}.
 
+%% store oid map, so columns know which table there belong to
+ready({oid_map, List}, _From, State) ->
+    #state{timeout = Timeout} = State,
+    {reply, ok, ready, State#state{oid_map = dict:from_list(List)}, State#state.timeout};
+
 %% execute simple query
 ready({squery, Sql}, From, State) ->
     #state{timeout = Timeout} = State,
@@ -309,7 +319,7 @@ querying({$3, <<>>}, State) ->
 %% RowDescription
 querying({$T, <<Count:?int16, Bin/binary>>}, State) ->
     #state{timeout = Timeout} = State,
-    Columns = decode_columns(Count, Bin),
+    Columns = decode_columns(State#state.oid_map, Count, Bin),
     S2 = (State#state.statement)#statement{columns = Columns},
     notify(State, {columns, Columns}),
     {next_state, querying, State#state{statement = S2}, Timeout};
@@ -407,7 +417,7 @@ describing({$t, <<_Count:?int16, Bin/binary>>}, State) ->
 
 %% RowDescription
 describing({$T, <<Count:?int16, Bin/binary>>}, State) ->
-    Columns = decode_columns(Count, Bin),
+  Columns = decode_columns(State#state.oid_map, Count, Bin),
     Columns2 = [C#column{format = format(C#column.type)} || C <- Columns],
     S2 = (State#state.statement)#statement{columns = Columns2},
     gen_fsm:reply(State#state.reply_to, {ok, S2}),
@@ -544,22 +554,34 @@ decode_data([C | T], <<Len:?int32, Value:Len/binary, Rest/binary>>, Acc) ->
     decode_data(T, Rest, [Value2 | Acc]).
 
 %% decode column information
-decode_columns(Count, Bin) ->
-    decode_columns(Count, Bin, []).
+decode_columns(OidMap, Count, Bin) ->
+    decode_columns(OidMap, Count, Bin, []).
 
-decode_columns(0, _Bin, Acc) ->
+decode_columns(_OidMap, 0, _Bin, Acc) ->
     lists:reverse(Acc);
-decode_columns(N, Bin, Acc) ->
-    {Name, Rest} = pgsql_sock:decode_string(Bin),
-    <<_Table_Oid:?int32, _Attrib_Num:?int16, Type_Oid:?int32,
-     Size:?int16, Modifier:?int32, Format:?int16, Rest2/binary>> = Rest,
-    Desc = #column{
-      name     = Name,
-      type     = pgsql_types:oid2type(Type_Oid),
-      size     = Size,
-      modifier = Modifier,
-      format   = Format},
-    decode_columns(N - 1, Rest2, [Desc | Acc]).
+
+decode_columns(OidMap, N, Bin, Acc) ->
+  {Name, Rest} = pgsql_sock:decode_string(Bin),
+  <<Table_Oid:?int32, _Attrib_Num:?int16, Type_Oid:?int32,
+  Size:?int16, Modifier:?int32, Format:?int16, Rest2/binary>> = Rest,
+
+  Desc = #column{
+    table    = lookup_table_name(OidMap, Table_Oid),
+    name     = Name,
+    type     = pgsql_types:oid2type(Type_Oid),
+    size     = Size,
+    modifier = Modifier,
+    format   = Format},
+  decode_columns(OidMap, N - 1, Rest2, [Desc | Acc]).
+
+lookup_table_name(undefined, Oid) -> Oid;
+lookup_table_name(Dict, Oid) ->
+  case dict:find(Oid, Dict) of
+    {ok, Value} ->
+      Value;
+    error ->
+      Oid
+  end.
 
 %% decode command complete msg
 decode_complete(<<"SELECT", 0>>)        -> select;

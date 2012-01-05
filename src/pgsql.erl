@@ -21,7 +21,18 @@ connect(Host, Username, Opts) ->
 
 connect(Host, Username, Password, Opts) ->
     {ok, C} = pgsql_connection:start_link(),
-    pgsql_connection:connect(C, Host, Username, Password, Opts).
+    case pgsql_connection:connect(C, Host, Username, Password, Opts) of
+      {ok, C} ->
+        {ok, _, Rows} = squery(C, "SELECT relname, oid FROM pg_class WHERE relkind = 'r'"),
+
+        OidMap = [ {list_to_integer(binary_to_list(Oid)), Relname} || {Relname, Oid} <- Rows ],
+        ok = pgsql_connection:store_oid_map(C, OidMap),
+
+        {ok, C};
+
+      Other ->
+        Other
+    end.
 
 close(C) when is_pid(C) ->
     catch pgsql_connection:stop(C),
@@ -70,7 +81,6 @@ bind(C, Statement, PortalName, Parameters) ->
     pgsql_connection:bind(C, Statement, PortalName, Parameters).
 
 %% execute
-
 execute(C, S) ->
     execute(C, S, "", 0).
 
